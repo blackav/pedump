@@ -107,6 +107,36 @@ struct IMAGE_SECTION_HEADER
     unsigned int   Characteristics;
 };
 
+struct IMAGE_EXPORT_DIRECTORY
+{
+    unsigned int Characteristics;
+    unsigned int TimeDateStamp;
+    unsigned short MajorVersion;
+    unsigned short MinorVersion;
+    unsigned int Name;
+    unsigned int Base;
+    unsigned int NumberOfFunctions;
+    unsigned int NumberOfNames;
+    unsigned int AddressOfFunctions;     // RVA from base of image
+    unsigned int AddressOfNames;         // RVA from base of image
+    unsigned int AddressOfNameOrdinals;  // RVA from base of image
+};
+
+struct IMAGE_IMPORT_DESCRIPTOR
+{
+    unsigned int OriginalFirstThunk; // RVA to original unbound IAT
+    unsigned int TimeDateStamp; // 0 if not bound,
+    unsigned int ForwarderChain; // -1 if no forwarders
+    unsigned int Name;
+    unsigned int FirstThunk; // RVA to IAT
+};
+
+struct IMAGE_IMPORT_BY_NAME
+{
+    unsigned short Hint;
+    char Name[1];
+};
+
 #define COFF_SYMBOL_ENTRY_SIZE 18
 struct COFF_SYMBOL_ENTRY
 {
@@ -133,7 +163,7 @@ do_read(int fd, void *ptr, size_t size)
     while (size > 0) {
         ssize_t r = read(fd, cur, size);
         if (r < 0) {
-            cerr << "input error" << endl;
+            cerr << "input error: " << strerror(errno) << endl;
             exit(1);
         }
         if (!r) {
@@ -268,6 +298,150 @@ main(int argc, char **argv)
         printf("  Section[%d].Characteristics: %08x\n", i, section_headers[i].Characteristics);
     }
 
+    // load the sections into memory
+    char **section_data = new char*[nt_header.FileHeader.NumberOfSections];
+    for (int i = 0; i < int(nt_header.FileHeader.NumberOfSections); ++i) {
+        //cerr << "Loading section " << i << endl;
+        section_data[i] = nullptr;
+        unsigned int sz = section_headers[i].Misc;
+        if (section_headers[i].SizeOfRawData > sz) sz = section_headers[i].SizeOfRawData;
+        sz = (sz + 0xfff) & ~0xfff;
+        if (sz > 0) {
+            section_data[i] = new char[sz];
+            if (section_headers[i].PointerToRawData && section_headers[i].SizeOfRawData) {
+                do_seek(fd, section_headers[i].PointerToRawData);
+                do_read(fd, section_data[i], section_headers[i].SizeOfRawData);
+            }
+        }
+    }
+
+    // process exports
+    unsigned export_rva = nt_header.OptionalHeader.DataDirectory[0].VirtualAddress;
+    unsigned export_size = nt_header.OptionalHeader.DataDirectory[0].Size;
+    if (export_rva && export_size) {
+        char *export_ptr = nullptr;
+        int export_index = -1;
+        const IMAGE_SECTION_HEADER *export_section = nullptr;
+        for (int i = 0; i < int(nt_header.FileHeader.NumberOfSections); ++i) {
+            if (section_headers[i].VirtualAddress <= export_rva
+                && export_rva + export_size < section_headers[i].VirtualAddress + section_headers[i].Misc) {
+                export_ptr = section_data[i] + (export_rva - section_headers[i].VirtualAddress);
+                export_index = i;
+                export_section = &section_headers[i];
+            }
+        }
+        if (!export_ptr) abort();
+        const IMAGE_EXPORT_DIRECTORY *expdir = (const IMAGE_EXPORT_DIRECTORY*) export_ptr;
+        printf("  ExportDir.Characteristics: %08x\n", expdir->Characteristics);
+        printf("  ExportDir.TimeDateStamp: %08x\n", expdir->TimeDateStamp);
+        printf("  ExportDir.MajorVersion: %04x\n", expdir->MajorVersion);
+        printf("  ExportDir.MinorVersion: %04x\n", expdir->MinorVersion);
+        const char *name_ptr = nullptr;
+        if (expdir->Name) {
+            name_ptr = section_data[export_index] + (expdir->Name - export_section->VirtualAddress);
+        }
+        printf("  ExportDir.Name: %08x (%s)\n", expdir->Name, name_ptr);
+        printf("  ExportDir.Base: %08x\n", expdir->Base);
+        printf("  ExportDir.NumberOfFunctions: %08x\n", expdir->NumberOfFunctions);
+        printf("  ExportDir.NumberOfNames: %08x\n", expdir->NumberOfNames);
+        printf("  ExportDir.AddressOfFunctions: %08x\n", expdir->AddressOfFunctions);
+        printf("  ExportDir.AddressOfNames: %08x\n", expdir->AddressOfNames);
+        printf("  ExportDir.AddressOfNameOrdinals: %08x\n", expdir->AddressOfNameOrdinals);
+        const unsigned *addresses = (const unsigned*) (section_data[export_index] + (expdir->AddressOfFunctions - export_section->VirtualAddress));
+        for (int i = 0; i < int(expdir->NumberOfFunctions); ++i) {
+            printf("    Function[%d]: %08x\n", expdir->Base + i, addresses[i]);
+        }
+        const unsigned *names = (const unsigned*) (section_data[export_index] + (expdir->AddressOfNames - export_section->VirtualAddress));
+        const unsigned short *ordinals = (const unsigned short *) (section_data[export_index] + (expdir->AddressOfNameOrdinals - export_section->VirtualAddress));
+        for (int i = 0; i < int(expdir->NumberOfNames); ++i) {
+            name_ptr = nullptr;
+            if (names[i]) {
+                name_ptr = section_data[export_index] + (names[i] - export_section->VirtualAddress);
+            }
+            printf("    Name[%d]: %08x, %s, %d\n", i, names[i], name_ptr, ordinals[i]);
+        }
+    }
+
+    unsigned import_rva = nt_header.OptionalHeader.DataDirectory[1].VirtualAddress;
+    unsigned import_size = nt_header.OptionalHeader.DataDirectory[1].Size;
+    if (import_rva && import_size) {
+        char *import_ptr = nullptr;
+        int import_index = -1;
+        const IMAGE_SECTION_HEADER *import_section = nullptr;
+        for (int i = 0; i < int(nt_header.FileHeader.NumberOfSections); ++i) {
+            if (section_headers[i].VirtualAddress <= import_rva
+                && import_rva + import_size < section_headers[i].VirtualAddress + section_headers[i].Misc) {
+                import_ptr = section_data[i] + (import_rva - section_headers[i].VirtualAddress);
+                import_index = i;
+                import_section = &section_headers[i];
+            }
+        }
+        if (!import_ptr) abort();
+        unsigned import_count = import_size / sizeof(IMAGE_IMPORT_DESCRIPTOR);
+        if (import_size % sizeof(IMAGE_IMPORT_DESCRIPTOR) != 0) abort();
+        const IMAGE_IMPORT_DESCRIPTOR *imports = (const IMAGE_IMPORT_DESCRIPTOR*) import_ptr;
+        for (int i = 0; i < int(import_count); ++i) {
+            printf("  ImportDesc[%d].OriginalFirstThunk: %08x\n", i, imports[i].OriginalFirstThunk);
+            printf("  ImportDesc[%d].TimeDateStamp: %08x\n", i, imports[i].TimeDateStamp);
+            printf("  ImportDesc[%d].ForwarderChain: %08x\n", i, imports[i].ForwarderChain);
+            const char *name_ptr = "";
+            if (imports[i].Name) {
+                name_ptr = section_data[import_index] + (imports[i].Name - import_section->VirtualAddress);
+            }
+            printf("  ImportDesc[%d].Name: %08x (%s)\n", i, imports[i].Name, name_ptr);
+            printf("  ImportDesc[%d].FirstThunk: %08x\n", i, imports[i].FirstThunk);
+            if (imports[i].OriginalFirstThunk) {
+                unsigned int *thunks = (unsigned int*) (section_data[import_index] + (imports[i].OriginalFirstThunk - import_section->VirtualAddress));
+                for (int j = 0; ; ++j) {
+                    printf("    OFT[%d]: %08x\n", j, thunks[j]);
+                    if (!thunks[j]) break;
+                    const IMAGE_IMPORT_BY_NAME *ibn = (const IMAGE_IMPORT_BY_NAME*)(section_data[import_index] + (thunks[j] - import_section->VirtualAddress));
+                    printf("      %d %s\n", ibn->Hint, ibn->Name);
+                }
+            }
+            if (imports[i].FirstThunk) {
+                unsigned int *thunks = (unsigned int*) (section_data[import_index] + (imports[i].FirstThunk - import_section->VirtualAddress));
+                for (int j = 0; ; ++j) {
+                    printf("    FT[%d]: %08x\n", j, thunks[j]);
+                    if (!thunks[j]) break;
+                }
+            }
+        }
+    }
+
+    unsigned reloc_rva = nt_header.OptionalHeader.DataDirectory[5].VirtualAddress;
+    unsigned reloc_size = nt_header.OptionalHeader.DataDirectory[5].Size;
+    if (reloc_rva && reloc_size) {
+        char *reloc_ptr = nullptr;
+        int reloc_index = -1;
+        const IMAGE_SECTION_HEADER *reloc_section = nullptr;
+        for (int i = 0; i < int(nt_header.FileHeader.NumberOfSections); ++i) {
+            if (section_headers[i].VirtualAddress <= reloc_rva
+                && reloc_rva + reloc_size <= section_headers[i].VirtualAddress + section_headers[i].Misc) {
+                reloc_ptr = section_data[i] + (reloc_rva - section_headers[i].VirtualAddress);
+                reloc_index = i;
+                reloc_section = &section_headers[i];
+            }
+        }
+        if (!reloc_ptr) abort();
+        printf("RelocationSection: %d\n", reloc_index);
+        char *cur_ptr = reloc_ptr;
+        while (1) {
+            unsigned page_rva = *(const unsigned*) cur_ptr;
+            unsigned block_size = *(const unsigned*) (cur_ptr + 4);
+            printf("  PageRVA: %08x\n", page_rva);
+            printf("  BlockSize: %08x\n", block_size);
+
+            int count = (block_size - 8) / 2;
+            unsigned short *page_relocs = (unsigned short*) (cur_ptr + 8);
+            for (int j = 0; j < count; ++j) {
+                printf("    %d %04x\n", (page_relocs[j] >> 12), page_relocs[j] & 0xfff);
+            }
+
+            cur_ptr += block_size;
+            if (cur_ptr - reloc_ptr >= int(reloc_size)) break;
+        }
+    }
 
     close(fd); fd = -1;
 
